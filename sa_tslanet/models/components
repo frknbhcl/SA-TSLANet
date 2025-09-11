@@ -1,0 +1,239 @@
+"""Core components for SA-TSLANet model."""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from timm.models.layers import trunc_normal_, DropPath
+
+
+class ICB(nn.Module):
+    """Interactive Convolution Block for multi-scale temporal feature extraction."""
+    
+    def __init__(self, in_features, hidden_features, drop=0.):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_features, hidden_features, 1)
+        self.conv2 = nn.Conv1d(in_features, hidden_features, 3, 1, padding=1)
+        self.conv3 = nn.Conv1d(hidden_features, in_features, 1)
+        self.drop = nn.Dropout(drop)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x1 = self.conv1(x)
+        x1_1 = self.act(x1)
+        x1_2 = self.drop(x1_1)
+
+        x2 = self.conv2(x)
+        x2_1 = self.act(x2)
+        x2_2 = self.drop(x2_1)
+
+        out1 = x1 * x2_2
+        out2 = x2 * x1_2
+
+        x = self.conv3(out1 + out2)
+        x = x.transpose(1, 2)
+        return x
+
+
+class Modified_Adaptive_Spectral_Block(nn.Module):
+    """Spindle-Aware Adaptive Spectral Block for frequency domain processing."""
+    
+    def __init__(self, dim, stride=1, sampling_rate=25600, padding_factor=16, adaptive_filter=True):
+        super().__init__()
+        
+        # Complex weights for different components
+        self.complex_weight_high = nn.Parameter(torch.randn(dim, 2, dtype=torch.float32) * 0.02)
+        self.complex_weight = nn.Parameter(torch.randn(dim, 2, dtype=torch.float32) * 0.02)
+        self.complex_weight_spindle = nn.Parameter(torch.randn(dim, 2, dtype=torch.float32) * 0.02)
+        self.complex_weight_chatter = nn.Parameter(torch.randn(dim, 2, dtype=torch.float32) * 0.02)
+        
+        # Initialize weights
+        trunc_normal_(self.complex_weight_high, std=.02)
+        trunc_normal_(self.complex_weight, std=.02)
+        trunc_normal_(self.complex_weight_spindle, std=.02)
+        trunc_normal_(self.complex_weight_chatter, std=.02)
+        
+        # Learnable thresholds
+        self.threshold_param = nn.Parameter(torch.rand(1))
+        self.threshold_spindle = nn.Parameter(torch.rand(1))
+        self.threshold_chatter = nn.Parameter(torch.rand(1))
+        
+        # Configuration
+        self.sampling_rate = int(1/(stride/sampling_rate))
+        self.padding_factor = padding_factor
+        self.adaptive_filter = adaptive_filter
+
+    def create_adaptive_high_freq_mask(self, x_fft, threshold):
+        """Create adaptive frequency mask based on energy distribution."""
+        B, _, _ = x_fft.shape
+        
+        # Calculate energy in frequency domain
+        energy = torch.abs(x_fft).pow(2).sum(dim=-1)
+        
+        # Normalize by median energy
+        flat_energy = energy.view(B, -1)
+        median_energy = flat_energy.median(dim=1, keepdim=True)[0]
+        median_energy = median_energy.view(B, 1)
+        
+        normalized_energy = energy / (median_energy + 1e-6)
+        
+        # Create soft mask using sigmoid-like function
+        adaptive_mask = ((normalized_energy > threshold).float() - threshold).detach() + threshold
+        adaptive_mask = adaptive_mask.unsqueeze(-1)
+        
+        return adaptive_mask
+
+    def forward(self, x_in, spindle_freq, masks):
+        """
+        Forward pass with spindle-aware spectral processing.
+        
+        Args:
+            x_in: Input tensor [B, N, C]
+            spindle_freq: Spindle frequencies [B]
+            masks: Spindle masks [B, freq_bins]
+        
+        Returns:
+            x: Processed output [B, N, C]
+            x_weighted_high: High frequency component
+            x_weighted_spindle: Spindle component
+            x_weighted_chatter: Chatter component
+        """
+        B, N, C = x_in.shape
+        dtype = x_in.dtype
+        x = x_in.to(torch.float32)
+        
+        # Prepare spindle mask
+        spindle_mask = masks.unsqueeze(-1)
+        
+        # Calculate padded length for better frequency resolution
+        N_padded = N * self.padding_factor
+        
+        # Apply FFT
+        x_fft = torch.fft.rfft(x, n=N_padded, dim=1, norm='ortho')
+        
+        # Global weighting
+        weight = torch.view_as_complex(self.complex_weight)
+        x_weighted_global = x_fft * weight
+        
+        if self.adaptive_filter:
+            # Adaptive high frequency mask
+            freq_mask = self.create_adaptive_high_freq_mask(x_fft, self.threshold_param)
+            x_masked = x_fft * freq_mask
+            weight_high = torch.view_as_complex(self.complex_weight_high)
+            x_weighted_high = x_masked * weight_high
+            
+            # Spindle component processing
+            x_masked_spindle = x_fft * spindle_mask
+            weight_spindle = torch.view_as_complex(self.complex_weight_spindle)
+            spindle_high_mask = self.create_adaptive_high_freq_mask(x_masked_spindle, self.threshold_spindle)
+            x_masked_spindle = x_masked_spindle * spindle_high_mask
+            x_weighted_spindle = x_masked_spindle * weight_spindle
+            
+            # Chatter component processing
+            chatter_mask = 1 - spindle_mask
+            x_masked_chatter = x_fft * chatter_mask
+            weight_chatter = torch.view_as_complex(self.complex_weight_chatter)
+            chatter_high_mask = self.create_adaptive_high_freq_mask(x_masked_chatter, self.threshold_chatter)
+            x_masked_chatter = x_masked_chatter * chatter_high_mask
+            x_weighted_chatter = x_masked_chatter * weight_chatter
+            
+            # Combine components
+            x_weighted = x_weighted_spindle + x_weighted_chatter
+        else:
+            x_weighted = x_weighted_global
+            x_weighted_high = x_weighted_global
+            x_weighted_spindle = x_weighted_global
+            x_weighted_chatter = torch.zeros_like(x_weighted_global)
+        
+        # Apply inverse FFT
+        x = torch.fft.irfft(x_weighted, n=N_padded, dim=1, norm='ortho')[:, :N, :]
+        
+        x = x.to(dtype)
+        x = x.view(B, N, C)
+        
+        return x, x_weighted_high, x_weighted_spindle, x_weighted_chatter
+
+
+class Modified_TSLANet_layer(nn.Module):
+    """Modified TSLANet layer with spindle-aware processing."""
+    
+    def __init__(self, dim, mlp_ratio=3., drop=0., drop_path=0., 
+                 norm_layer=nn.LayerNorm, stride=1, adaptive_filter=True,
+                 use_icb=True, use_asb=True):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.asb = Modified_Adaptive_Spectral_Block(dim, stride=stride, adaptive_filter=adaptive_filter)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.icb = ICB(in_features=dim, hidden_features=mlp_hidden_dim, drop=drop)
+        self.use_icb = use_icb
+        self.use_asb = use_asb
+
+    def forward(self, x, spindle_freq, masks):
+        if self.use_icb and self.use_asb:
+            out, x_weighted_high, x_weighted_spindle, x_weighted_chatter = self.asb(
+                self.norm1(x), spindle_freq, masks
+            )
+            x = x + self.drop_path(self.icb(self.norm2(out)))
+        elif self.use_icb:
+            x = x + self.drop_path(self.icb(self.norm2(x)))
+            x_weighted_high = x_weighted_spindle = x_weighted_chatter = None
+        elif self.use_asb:
+            out, x_weighted_high, x_weighted_spindle, x_weighted_chatter = self.asb(
+                self.norm1(x), spindle_freq, masks
+            )
+            x = x + self.drop_path(out)
+        else:
+            x_weighted_high = x_weighted_spindle = x_weighted_chatter = None
+            
+        return x, x_weighted_high, x_weighted_spindle, x_weighted_chatter
+
+
+class SpindleMaskGenerator(nn.Module):
+    """Generate frequency masks for spindle harmonics."""
+    
+    def __init__(self, N_freq_bins, num_channels=1, sampling_rate=25600, 
+                 bandwidth=6, max_harmonic=5000):
+        super().__init__()
+        self.num_channels = num_channels
+        self.sampling_rate = sampling_rate
+        self.N_freq_bins = N_freq_bins
+        self.max_harmonic = max_harmonic
+        self.bandwidth = bandwidth
+        
+        # Pre-compute frequency bins
+        self.register_buffer('freqs', torch.fft.rfftfreq((N_freq_bins-1)*2, d=1.0/sampling_rate))
+
+    def create_spindle_mask(self, spindle_freq):
+        """
+        Create spindle mask with Gaussian windows around harmonics.
+        
+        Args:
+            spindle_freq: Tensor of spindle frequencies [batch_size]
+            
+        Returns:
+            mask: Tensor of shape [batch_size, N_freq_bins]
+        """
+        batch_size = spindle_freq.size(0)
+        mask = torch.zeros((batch_size, self.N_freq_bins), device=spindle_freq.device)
+        
+        freqs_expanded = self.freqs.unsqueeze(0).expand(batch_size, -1)
+        
+        for b in range(batch_size):
+            sf = spindle_freq[b]
+            # Calculate harmonics
+            harmonics = torch.arange(1, self.max_harmonic + 1, device=spindle_freq.device) * sf
+            
+            # Keep only harmonics below Nyquist frequency
+            harmonics = harmonics[harmonics < self.sampling_rate/2]
+            
+            # Create Gaussian windows around each harmonic
+            for h in harmonics:
+                window = torch.exp(-(freqs_expanded[b] - h)**2 / (2 * self.bandwidth**2))
+                mask[b] += window
+        
+        # Normalize mask to [0, 1]
+        mask = mask / (mask.max(dim=1, keepdim=True)[0] + 1e-6)
+        return mask
