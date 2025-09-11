@@ -22,7 +22,7 @@ SA-TSLANet extends the TSLANet architecture with:
 - **Interactive Convolution Block (ICB)**: Captures multi-scale temporal patterns
 - **Multi-objective loss function**: Combines crest factor, spindle, and ratio losses
 
-![Architecture Diagram](docs/images/Tslanet_Architecture.png)
+![Architecture Diagram](docs/images/Tslanet_Architecture.PNG)
 
 ## Installation
 ```bash
